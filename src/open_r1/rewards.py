@@ -9,7 +9,22 @@ from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 
 from .utils import is_e2b_available
+from .utils import util
+import torch
+import torch.nn.functional as F
 
+def get_embedding(text, tokenizer, model, device="cpu"):
+    """
+    将 text 编码成模型的embedding（简单做法：取最后一层 hidden_state 的平均池化）。
+    """
+    inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = model(**inputs, output_hidden_states=True)
+        # 这里 outputs.last_hidden_state 的 shape: [batch_size, seq_len, hidden_dim]
+        hidden_states = outputs.last_hidden_state
+        embedding = hidden_states.mean(dim=1)  # [batch_size, hidden_dim]
+    return embedding
 
 if is_e2b_available():
     from dotenv import load_dotenv
@@ -92,6 +107,62 @@ def tag_count_reward(completions, **kwargs) -> list[float]:
 
     contents = [completion[0]["content"] for completion in completions]
     return [count_tags(c) for c in contents]
+
+def problem_generate_reward(
+    completions,
+    original_problem=None,
+    complex_problem=None,
+    tokenizer=None,
+    model=None,
+    device="cpu",
+    **kwargs
+):
+    """
+    使用余弦相似度之差来计算奖励:
+      - completions: List[str]，模型输出
+      - original_problem: List[str]，原始问题
+      - complex_problem: List[str]，复杂问题（希望 parse_problem 与其相距远）
+      - tokenizer: 与 model 配套的 tokenizer
+      - model: 用来抽取embedding的模型（例如一个支持 output_hidden_states=True 的 Transformers 模型）
+      - device: 默认为 "cpu"，也可以是 "cuda"
+      - **kwargs: 其余可能由 Trainer 传进来的字段（比如 "solution" 等，你用不用随你）
+    """
+
+    if original_problem is None or complex_problem is None:
+        raise ValueError("original_problem 与 complex_problem 不能为空")
+    if len(completions) != len(original_problem) or len(completions) != len(complex_problem):
+        raise ValueError("completions, original_problem, complex_problem 的长度必须相同")
+
+    rewards = []
+
+    for completion, op, cp in zip(completions, original_problem, complex_problem):
+        # 1) 解析出 parse_problem（以及 parse_solution, 这里假设 parse_solution 不参与计算）
+        parse_problem, parse_solution = util.parse_answer(
+            completion,
+            ["Complex Question", "Complex Answer"],
+            None
+        )
+        if parse_problem and parse_solution:
+            # 2) 分别获取 parse_problem, original_problem, complex_problem 的 embedding
+            emb_parse_problem   = get_embedding(parse_problem,   tokenizer, model, device)
+            emb_original_problem = get_embedding(op,            tokenizer, model, device)
+            emb_complex_problem  = get_embedding(cp,            tokenizer, model, device)
+
+            # 3) 计算余弦相似度
+            #    注意: emb_xxx 形状是 [1, hidden_dim]
+            #    => F.cosine_similarity(emb_a, emb_b) -> [1]
+            cos_to_original = F.cosine_similarity(emb_parse_problem, emb_original_problem).item()
+            cos_to_complex  = F.cosine_similarity(emb_parse_problem, emb_complex_problem).item()
+
+            # 4) 定义 reward = cos(parse_problem, original) - cos(parse_problem, complex)
+            reward = cos_to_original - cos_to_complex
+            rewards.append(reward)
+        else:
+            # 如果解析失败，就给一个负分
+            rewards.append(-1.0)
+
+    return rewards
+
 
 
 def reasoning_steps_reward(completions, **kwargs):

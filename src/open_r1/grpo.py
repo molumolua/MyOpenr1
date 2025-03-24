@@ -23,7 +23,7 @@ import transformers
 from datasets import load_dataset
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
-
+from functools import partial
 from open_r1.configs import GRPOConfig
 from open_r1.rewards import (
     accuracy_reward,
@@ -35,12 +35,13 @@ from open_r1.rewards import (
     len_reward,
     reasoning_steps_reward,
     tag_count_reward,
+    problem_generate_reward
 )
 from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
-
+from transformers import AutoTokenizer, AutoModel
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +157,16 @@ def main(script_args, training_args, model_args):
     ################
     tokenizer = get_tokenizer(model_args, training_args)
 
+    #####################################
+    # ==== 新增：加载BERT tokenizer & model
+    #####################################
+    bert_model_name = "bert-base-uncased"  # 你也可换成别的BERT变体
+    bert_tokenizer = AutoTokenizer.from_pretrained(bert_model_name)
+    bert_model = AutoModel.from_pretrained(bert_model_name)
+    bert_device="cpu"
+    bert_model.to(bert_device)
+    bert_model.eval()
+
     # Get reward functions
     REWARD_FUNCS_REGISTRY = {
         "accuracy": accuracy_reward,
@@ -176,16 +187,25 @@ def main(script_args, training_args, model_args):
         "code": code_reward,
         "code_format": get_code_format_reward(language=script_args.code_language),
         "tag_count": tag_count_reward,
+        
+        ###################################################
+        # ==== 新增：注册我们的 my_bert_reward 到字典里 ====
+        ###################################################
+        "problem_generate_reward": partial(
+            problem_generate_reward,
+            tokenizer=bert_tokenizer,
+            model=bert_model,
+            device=bert_device
+        ),
     }
+
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
 
     # Format into conversation
     def make_conversation(example):
         prompt = []
-
         if training_args.system_prompt is not None:
             prompt.append({"role": "system", "content": training_args.system_prompt})
-
         prompt.append({"role": "user", "content": example["problem"]})
         return {"prompt": prompt}
 
