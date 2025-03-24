@@ -158,9 +158,9 @@ def main(script_args, training_args, model_args):
     tokenizer = get_tokenizer(model_args, training_args)
 
     #####################################
-    # ==== 新增：加载BERT tokenizer & model
+    # 加载BERT tokenizer & model
     #####################################
-    bert_model_name = "bert-base-uncased"  # 你也可换成别的BERT变体
+    bert_model_name = "bert-base-uncased" 
     bert_tokenizer = AutoTokenizer.from_pretrained(bert_model_name)
     bert_model = AutoModel.from_pretrained(bert_model_name)
     bert_device="cpu"
