@@ -15,6 +15,7 @@
 import logging
 import os
 import sys
+import datetime
 from dataclasses import dataclass, field
 
 import datasets
@@ -35,17 +36,127 @@ from open_r1.rewards import (
     len_reward,
     reasoning_steps_reward,
     tag_count_reward,
-    problem_generate_reward
+    problem_generate_reward,
+    accuracy_check
 )
 from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
 from open_r1.utils.wandb_logging import init_wandb_training
 from trl import GRPOTrainer, ModelConfig, ScriptArguments, TrlParser, get_peft_config
 from transformers import AutoTokenizer, AutoModel
-
+from datasets import load_dataset
+from torch.utils.data import DataLoader, Dataset, IterableDataset, RandomSampler, SequentialSampler
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from types import MethodType
+from vllm import LLM, SamplingParams
+from typing_extensions import override
+import json
 logger = logging.getLogger(__name__)
+# Format into conversation
+from dataclasses import dataclass, field
+from typing import Optional
+import math
+
+from accelerate.utils import gather_object
+import trl
 
 
+# TODO: add the shared options with a mixin to reduce code duplication
+
+class MathGRPOTrainer(GRPOTrainer):
+    @override
+    def evaluate(
+        self,
+        eval_dataset: Optional[Dataset] = None,
+        ignore_keys: Optional[List[str]] = None,
+        metric_key_prefix: str = "eval",
+        **gen_kwargs,
+    ) -> Dict[str, float]:
+        """
+        使用多进程并行进行评测，每个进程都加载 vLLM 并处理部分 eval_dataset，然后主进程汇总结果。
+        """
+        if self.accelerator.is_main_process:
+            logger.info("Start Eval Math (Multi-Process).")
+
+            if eval_dataset is None:
+                eval_dataset = self.eval_dataset
+
+            self._move_model_to_vllm()
+            model = self.llm
+
+            # ------- 3) 在本进程上做推理 -------
+            stop_words = ["</s>", "<｜Assistant｜>", "<|endoftext|>", "<｜User｜>"]
+
+            # 构建 prompt
+            input_texts = [
+                self.processing_class.apply_chat_template(
+                    [
+                        {"role": "system", "content": self.args.system_prompt},
+                        {"role": "user",   "content": problem['problem']},
+                    ],
+                    tokenize=False,
+                    add_generation_prompt=True,
+                )
+                for problem in eval_dataset
+            ]
+
+            sampling_params = SamplingParams(
+                max_tokens=32678,
+                temperature=0.6,
+                stop=stop_words,
+                n=1
+            )
+
+            # 使用 vLLM 在本进程完成推理
+            generated_responses = model.generate(input_texts, sampling_params=sampling_params)
+            generated_responses = [resp.outputs[0].text for resp in generated_responses]
+
+            local_correct = 0
+            for problem, response in zip(eval_dataset, generated_responses):
+                if accuracy_check(problem,'solution', response):
+                    local_correct += 1
+
+            local_results = {
+                "problems": [p for p in eval_dataset],
+                "responses": generated_responses,
+                "correct_count": local_correct,
+                "size": len(eval_dataset)
+            }
+
+
+            all_answered_problems = [ problem for problem in eval_dataset]
+
+            # 计算全局分数
+            score = (local_correct / local_results['size'] * 100) if local_results['size'] > 0 else 0.0
+
+            metrics = {
+                "steps": self.state.global_step,
+                f"{metric_key_prefix}_math_score": score
+            }
+            logger.info(f"Total collected problems: {local_results['size']}")
+            logger.info(f"Math Score : {score}")
+
+            # 保存结果
+            os.makedirs(self.args.output_dir, exist_ok=True)
+
+            raw_result_file = os.path.join(self.args.output_dir, "eval_problems.json")
+            with open(raw_result_file, 'w', encoding='utf-8') as f:
+                json.dump(all_answered_problems, f, indent=4, ensure_ascii=False)
+
+            # 读已有的 metrics，追加本次记录
+            metrics_file = os.path.join(self.args.output_dir, "eval_metrics.json")
+            if os.path.exists(metrics_file):
+                with open(metrics_file, 'r') as f:
+                    all_metrics = json.load(f)
+            else:
+                all_metrics = []
+
+            all_metrics.append(metrics)
+            with open(metrics_file, 'w') as f:
+                json.dump(all_metrics, f, indent=4)
+
+            return metrics
+    
 @dataclass
 class GRPOScriptArguments(ScriptArguments):
     """
@@ -110,11 +221,18 @@ class GRPOScriptArguments(ScriptArguments):
         },
     )
 
+    eval_dataset_config: str = field(
+        default=None,
+        metadata={
+            "help":"eval data path"
+        }
+    )
+
 
 def main(script_args, training_args, model_args):
     # Set seed for reproducibility
     set_seed(training_args.seed)
-
+    training_args.ddp_timeout=360000000
     ###############
     # Setup logging
     ###############
@@ -157,15 +275,15 @@ def main(script_args, training_args, model_args):
     ################
     tokenizer = get_tokenizer(model_args, training_args)
 
-    #####################################
-    # 加载BERT tokenizer & model
-    #####################################
-    bert_model_name = "bert-base-uncased" 
-    bert_tokenizer = AutoTokenizer.from_pretrained(bert_model_name)
-    bert_model = AutoModel.from_pretrained(bert_model_name)
-    bert_device="cpu"
-    bert_model.to(bert_device)
-    bert_model.eval()
+    # #####################################
+    # # 加载BERT tokenizer & model
+    # #####################################
+    # bert_model_name = "bert-base-uncased" 
+    # bert_tokenizer = AutoTokenizer.from_pretrained(bert_model_name)
+    # bert_model = AutoModel.from_pretrained(bert_model_name)
+    # bert_device="cpu"
+    # bert_model.to(bert_device)
+    # bert_model.eval()
 
     # Get reward functions
     REWARD_FUNCS_REGISTRY = {
@@ -188,15 +306,15 @@ def main(script_args, training_args, model_args):
         "code_format": get_code_format_reward(language=script_args.code_language),
         "tag_count": tag_count_reward,
         
-        ###################################################
-        # ==== 新增：注册我们的 my_bert_reward 到字典里 ====
-        ###################################################
-        "problem_generate_reward": partial(
-            problem_generate_reward,
-            tokenizer=bert_tokenizer,
-            model=bert_model,
-            device=bert_device
-        ),
+        # ###################################################
+        # # ==== 新增：注册我们的 my_bert_reward 到字典里 ====
+        # ###################################################
+        # "problem_generate_reward": partial(
+        #     problem_generate_reward,
+        #     tokenizer=bert_tokenizer,
+        #     model=bert_model,
+        #     device=bert_device
+        # ),
     }
 
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]
@@ -210,7 +328,7 @@ def main(script_args, training_args, model_args):
         return {"prompt": prompt}
 
     dataset = dataset.map(make_conversation)
-
+    logger.info(f"eval strategy:{training_args.eval_strategy}")
     for split in dataset:
         if "messages" in dataset[split].column_names:
             dataset[split] = dataset[split].remove_columns("messages")
@@ -227,16 +345,17 @@ def main(script_args, training_args, model_args):
         use_cache=False if training_args.gradient_checkpointing else True,
     )
     training_args.model_init_kwargs = model_kwargs
-
+    logger.info("*** Initializing GRPO trainer ***")
     #############################
     # Initialize the GRPO trainer
     #############################
-    trainer = GRPOTrainer(
+    eval_dataset = load_dataset(script_args.dataset_name, data_files=script_args.eval_dataset_config, split="train")
+    trainer = MathGRPOTrainer(
         model=model_args.model_name_or_path,
         reward_funcs=reward_funcs,
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
-        eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
+        eval_dataset=eval_dataset if training_args.eval_strategy != "no" else None,
         peft_config=get_peft_config(model_args),
         callbacks=get_callbacks(training_args, model_args),
         processing_class=tokenizer,
