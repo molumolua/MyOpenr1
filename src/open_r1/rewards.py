@@ -35,7 +35,6 @@ if is_e2b_available():
 def accuracy_check(problem,section, solution, **kwargs):
     """Reward function that checks if the completion is the same as the ground truth."""
     content = problem[section]
-    rewards = []
     gold_parsed = parse(
         content,
         extraction_mode="first_match",
@@ -64,8 +63,9 @@ def accuracy_check(problem,section, solution, **kwargs):
         )
             # Reward 1 if the content is the same as the ground truth, 0 otherwise
         try:
-            problem['raw_answer']=gold_parsed
-            problem['model_answer']=answer_parsed
+            problem['raw_answer']=str(gold_parsed)
+            problem['model_solution']=solution
+            problem['model_answer']=str(answer_parsed)
             reward = float(verify(answer_parsed, gold_parsed))
         except Exception as e:
             print(f"verify failed: {e}, answer: {answer_parsed}, gold: {gold_parsed}")
@@ -74,9 +74,8 @@ def accuracy_check(problem,section, solution, **kwargs):
         # If the gold solution is not parseable, we reward 1 to skip this example
         reward = 0.0
         print("Failed to parse gold solution: ", content)
-    rewards.append(reward)
 
-    return rewards
+    return reward
 def accuracy_reward(completions, solution, **kwargs):
     """Reward function that checks if the completion is the same as the ground truth."""
     contents = [completion[0]["content"] for completion in completions]

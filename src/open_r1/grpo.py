@@ -62,7 +62,8 @@ import trl
 
 
 # TODO: add the shared options with a mixin to reduce code duplication
-
+def add_temp_answer_to_problem(problem,response):
+    problem['model_answer']=response
 class MathGRPOTrainer(GRPOTrainer):
     @override
     def evaluate(
@@ -75,87 +76,92 @@ class MathGRPOTrainer(GRPOTrainer):
         """
         使用多进程并行进行评测，每个进程都加载 vLLM 并处理部分 eval_dataset，然后主进程汇总结果。
         """
+        if self.state.global_step != self._last_loaded_step:
+            self._move_model_to_vllm()
+            self._last_loaded_step = self.state.global_step
+
         if self.accelerator.is_main_process:
             logger.info("Start Eval Math (Multi-Process).")
 
             if eval_dataset is None:
-                eval_dataset = self.eval_dataset
+                eval_dataset = list(self.eval_dataset)
 
-            self._move_model_to_vllm()
             model = self.llm
+            with torch.no_grad():
+                # ------- 3) 在本进程上做推理 -------
+                stop_words = ["</s>", "<｜Assistant｜>", "<|endoftext|>", "<｜User｜>","<|im_end|>"]
 
-            # ------- 3) 在本进程上做推理 -------
-            stop_words = ["</s>", "<｜Assistant｜>", "<|endoftext|>", "<｜User｜>"]
+                # 构建 prompt
+                input_texts = [
+                    self.processing_class.apply_chat_template(
+                        [
+                            {"role": "system", "content": self.args.system_prompt},
+                            {"role": "user",   "content": problem['problem']},
+                        ],
+                        tokenize=False,
+                        add_generation_prompt=True,
+                    )
+                    for problem in eval_dataset
+                ]
 
-            # 构建 prompt
-            input_texts = [
-                self.processing_class.apply_chat_template(
-                    [
-                        {"role": "system", "content": self.args.system_prompt},
-                        {"role": "user",   "content": problem['problem']},
-                    ],
-                    tokenize=False,
-                    add_generation_prompt=True,
+                sampling_params = SamplingParams(
+                    max_tokens=32678,
+                    temperature=0,
+                    top_p=1,
+                    stop=stop_words,
+                    n=1
                 )
-                for problem in eval_dataset
-            ]
 
-            sampling_params = SamplingParams(
-                max_tokens=32678,
-                temperature=0.6,
-                stop=stop_words,
-                n=1
-            )
+                # 使用 vLLM 在本进程完成推理
+                generated_responses = model.generate(input_texts, sampling_params=sampling_params)
+                generated_responses = [resp.outputs[0].text for resp in generated_responses]
 
-            # 使用 vLLM 在本进程完成推理
-            generated_responses = model.generate(input_texts, sampling_params=sampling_params)
-            generated_responses = [resp.outputs[0].text for resp in generated_responses]
+                local_correct = 0
+                all_answered_problems = [ problem for problem in eval_dataset]
+                for problem,response in zip(all_answered_problems,generated_responses):
+                    add_temp_answer_to_problem(problem,response)
+                    tmp_correct=accuracy_check(problem,'solution', response)
+                    if tmp_correct>0:
+                        local_correct += 1
+                    problem['correct_check']=str(tmp_correct)
+                    
 
-            local_correct = 0
-            for problem, response in zip(eval_dataset, generated_responses):
-                if accuracy_check(problem,'solution', response):
-                    local_correct += 1
+                local_results = {
+                    "problems": [p for p in eval_dataset],
+                    "responses": generated_responses,
+                    "correct_count": local_correct,
+                    "size": len(eval_dataset)
+                }
+                # 计算全局分数
+                score = (local_correct / local_results['size'] * 100) if local_results['size'] > 0 else 0.0
 
-            local_results = {
-                "problems": [p for p in eval_dataset],
-                "responses": generated_responses,
-                "correct_count": local_correct,
-                "size": len(eval_dataset)
-            }
+                metrics = {
+                    "steps": self.state.global_step,
+                    f"{metric_key_prefix}_math_score": score
+                }
+                logger.info(f"Total collected problems: {local_results['size']}")
+                logger.info(f"Math Score : {score}")
 
+                # 保存结果
+                os.makedirs(self.args.output_dir, exist_ok=True)
 
-            all_answered_problems = [ problem for problem in eval_dataset]
+                raw_result_file = os.path.join(self.args.output_dir, "eval_problems.json")
+                with open(raw_result_file, 'w', encoding='utf-8') as f:
+                    json.dump(all_answered_problems, f, indent=4, ensure_ascii=False)
 
-            # 计算全局分数
-            score = (local_correct / local_results['size'] * 100) if local_results['size'] > 0 else 0.0
+                # 读已有的 metrics，追加本次记录
+                metrics_file = os.path.join(self.args.output_dir, "eval_metrics.json")
+                if os.path.exists(metrics_file):
+                    with open(metrics_file, 'r') as f:
+                        all_metrics = json.load(f)
+                else:
+                    all_metrics = []
 
-            metrics = {
-                "steps": self.state.global_step,
-                f"{metric_key_prefix}_math_score": score
-            }
-            logger.info(f"Total collected problems: {local_results['size']}")
-            logger.info(f"Math Score : {score}")
+                all_metrics.append(metrics)
+                with open(metrics_file, 'w') as f:
+                    json.dump(all_metrics, f, indent=4)
 
-            # 保存结果
-            os.makedirs(self.args.output_dir, exist_ok=True)
-
-            raw_result_file = os.path.join(self.args.output_dir, "eval_problems.json")
-            with open(raw_result_file, 'w', encoding='utf-8') as f:
-                json.dump(all_answered_problems, f, indent=4, ensure_ascii=False)
-
-            # 读已有的 metrics，追加本次记录
-            metrics_file = os.path.join(self.args.output_dir, "eval_metrics.json")
-            if os.path.exists(metrics_file):
-                with open(metrics_file, 'r') as f:
-                    all_metrics = json.load(f)
-            else:
-                all_metrics = []
-
-            all_metrics.append(metrics)
-            with open(metrics_file, 'w') as f:
-                json.dump(all_metrics, f, indent=4)
-
-            return metrics
+                return metrics
     
 @dataclass
 class GRPOScriptArguments(ScriptArguments):
@@ -228,6 +234,13 @@ class GRPOScriptArguments(ScriptArguments):
         }
     )
 
+    eval_dataset_size: int =field(
+        default=7500,
+        metadata={
+            "help":"random select subset from the raw dataset"
+        }
+    )
+
 
 def main(script_args, training_args, model_args):
     # Set seed for reproducibility
@@ -269,7 +282,16 @@ def main(script_args, training_args, model_args):
 
     # Load the dataset
     dataset = load_dataset(script_args.dataset_name, data_files=script_args.dataset_config)
+    # 保存结果
+    os.makedirs(training_args.output_dir, exist_ok=True)
 
+    raw_result_file = os.path.join(training_args.output_dir, "eval_problems.json")
+    with open(raw_result_file, 'w', encoding='utf-8') as f:
+        json.dump([], f, indent=4, ensure_ascii=False)
+
+    metrics_file = os.path.join(training_args.output_dir, "eval_metrics.json")
+    with open(metrics_file, 'w') as f:
+        json.dump([], f, indent=4)
     ################
     # Load tokenizer
     ################
@@ -350,6 +372,8 @@ def main(script_args, training_args, model_args):
     # Initialize the GRPO trainer
     #############################
     eval_dataset = load_dataset(script_args.dataset_name, data_files=script_args.eval_dataset_config, split="train")
+
+    eval_dataset=eval_dataset.shuffle(seed=training_args.seed).select(range(script_args.eval_dataset_size))
     trainer = MathGRPOTrainer(
         model=model_args.model_name_or_path,
         reward_funcs=reward_funcs,
