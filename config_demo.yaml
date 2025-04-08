@@ -1,5 +1,5 @@
 # Model arguments
-model_name_or_path: /data2/xucaijun/DeepSeek-R1-Distill-Qwen-1.5B
+model_name_or_path: /data2/xucaijun/Qwen/Qwen2.5-1.5B-Instruct
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
@@ -7,21 +7,27 @@ attn_implementation: flash_attention_2
 # Data training arguments
 # We edit the DeepSeek chat template to ensure (a) the reasoning block within <think> and </think> is included in the completion and (b) the <think> tag is not part of the prefill so that the format reward works
 dataset_name: json
-dataset_config: /data2/xucaijun/Math-Generator/outputs/open-r1-second_iter.json
-eval_dataset_config: /data2/xucaijun/Math-Generator/deepseek-math/0/math_output_deepseek.json
-system_prompt: "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer, and put your final answer within \\boxed{{}} . The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. Note that respond by English, NOT use other languages."
-eval_dataset_size: 500
+dataset_config: /data2/xucaijun/Math-Generator/outputs/openr1_glm_5-9.json
+
+eval_dataset_name: json
+# eval_dataset_name: HuggingFaceH4/MATH-500
+eval_dataset_config: /data2/xucaijun/MathEvaluation/evaluation/data/math/test.jsonl
+eval_dataset_size: 5000
+# system_prompt: "You are a helpful AI Assistant that provides well-reasoned and detailed responses. You first think about the reasoning process as an internal monologue and then provide the user with the answer. Respond in the following format: <think>\n...\n</think>\n<answer>\n...\n</answer>"
+system_prompt: "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in the mind and then provides the user with the answer, and put your final answer within \\boxed{{}} . The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>."
 # GRPO trainer config
 eval_strategy: steps
-eval_steps: 20
+eval_steps: 50
 save_strategy: epoch
 save_strategy: steps
-save_steps: 20
+save_steps: 50
 
 bf16: true
 use_vllm: true
 vllm_device: auto
-vllm_gpu_memory_utilization: 0.9
+vllm_gpu_memory_utilization: 0.7
+vllm_enforce_eager: true
+vllm_max_model_len: 4608
 gradient_accumulation_steps: 4
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
@@ -38,11 +44,11 @@ lr_scheduler_type: cosine_with_min_lr
 lr_scheduler_kwargs:
   min_lr_rate: 0.1
 max_prompt_length: 512
-max_completion_length: 2048
+max_completion_length: 3584
 max_steps: -1
 num_generations: 16
 num_train_epochs: 1
-output_dir: data/DeepSeek-R1-Distill-Qwen-1.5B
+output_dir: data/glm-5-9-Qwen2.5-1.5B-Instruct
 overwrite_output_dir: true
 per_device_eval_batch_size: 16
 per_device_train_batch_size: 16
@@ -52,9 +58,13 @@ report_to:
 reward_funcs:
 - format
 - cosine
+# - tag_count
+# - accuracy
 reward_weights:
 - 1.0
 - 2.0
+# - 1.0
+# - 1.0
 save_total_limit: 10
 seed: 42
 temperature: 0.7

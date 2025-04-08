@@ -37,7 +37,8 @@ from open_r1.rewards import (
     reasoning_steps_reward,
     tag_count_reward,
     problem_generate_reward,
-    accuracy_check
+    accuracy_check,
+    after_think_format_reward
 )
 from open_r1.utils import get_tokenizer
 from open_r1.utils.callbacks import get_callbacks
@@ -60,6 +61,19 @@ import math
 from accelerate.utils import gather_object
 import trl
 
+import json
+import sympy
+
+class CustomSympyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        # 针对 sympy 的矩阵对象进行特殊处理
+        if isinstance(obj, sympy.MatrixBase):
+            # 将矩阵转换为列表的列表
+            return str(obj.tolist())
+        # 针对其他 sympy 对象可以转换为字符串，或者根据需要进一步处理
+        if isinstance(obj, sympy.Basic):
+            return str(obj)
+        return super().default(obj)
 
 # TODO: add the shared options with a mixin to reduce code duplication
 def add_temp_answer_to_problem(problem,response):
@@ -106,8 +120,8 @@ class MathGRPOTrainer(GRPOTrainer):
 
                 sampling_params = SamplingParams(
                     max_tokens=32678,
-                    temperature=0,
-                    top_p=1,
+                    temperature=0.6,
+                    top_p=0.95,
                     stop=stop_words,
                     n=1
                 )
@@ -147,7 +161,7 @@ class MathGRPOTrainer(GRPOTrainer):
 
                 raw_result_file = os.path.join(self.args.output_dir, "eval_problems.json")
                 with open(raw_result_file, 'w', encoding='utf-8') as f:
-                    json.dump(all_answered_problems, f, indent=4, ensure_ascii=False)
+                    json.dump(all_answered_problems, f, indent=4, ensure_ascii=False,cls=CustomSympyEncoder)
 
                 # 读已有的 metrics，追加本次记录
                 metrics_file = os.path.join(self.args.output_dir, "eval_metrics.json")
@@ -159,7 +173,7 @@ class MathGRPOTrainer(GRPOTrainer):
 
                 all_metrics.append(metrics)
                 with open(metrics_file, 'w') as f:
-                    json.dump(all_metrics, f, indent=4)
+                    json.dump(all_metrics, f, indent=4,cls=CustomSympyEncoder)
 
                 return metrics
     
@@ -225,6 +239,12 @@ class GRPOScriptArguments(ScriptArguments):
             "help": "Language for code format reward. Based on E2B supported languages https://e2b.dev/docs/code-interpreting/supported-languages",
             "choices": ["python", "javascript", "r", "java", "bash"],
         },
+    )
+    eval_dataset_name: str = field(
+        default="json",
+        metadata={
+            "help":"download data from huggingface or json"
+        }
     )
 
     eval_dataset_config: str = field(
@@ -337,6 +357,7 @@ def main(script_args, training_args, model_args):
         #     model=bert_model,
         #     device=bert_device
         # ),
+        "after_think_format":after_think_format_reward,
     }
 
     reward_funcs = [REWARD_FUNCS_REGISTRY[func] for func in script_args.reward_funcs]

@@ -63,9 +63,9 @@ def accuracy_check(problem,section, solution, **kwargs):
         )
             # Reward 1 if the content is the same as the ground truth, 0 otherwise
         try:
-            problem['raw_answer']=str(gold_parsed)
+            problem['raw_answer']=gold_parsed
             problem['model_solution']=solution
-            problem['model_answer']=str(answer_parsed)
+            problem['model_answer'] =answer_parsed
             reward = float(verify(answer_parsed, gold_parsed))
         except Exception as e:
             print(f"verify failed: {e}, answer: {answer_parsed}, gold: {gold_parsed}")
@@ -128,6 +128,19 @@ def format_reward(completions, **kwargs):
     completion_contents = [completion[0]["content"] for completion in completions]
     matches = [re.match(pattern, content, re.DOTALL | re.MULTILINE) for content in completion_contents]
     return [1.0 if match else 0.0 for match in matches]
+
+def after_think_format_reward(completions,**kwargs):
+    """Reward function that checks if the reasoning process is enclosed within <think> and </think> tags, while the final answer is enclosed within <answer> and </answer> tags."""
+    
+    def count_tags(text: str) -> float:
+        count = 0.0
+        # We only count </think> tag, because <think> tag is available in system prompt
+        if text.count("\n</think>\n") == 1:
+            count += 1.0
+        return count
+
+    contents = [completion[0]["content"] for completion in completions]
+    return [count_tags(c) for c in contents]
 
 
 def tag_count_reward(completions, **kwargs) -> list[float]:
